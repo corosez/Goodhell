@@ -60,6 +60,7 @@ import tempfile
 import httpx
 import pty
 import fcntl
+import select
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
@@ -1601,22 +1602,30 @@ Your enhanced server is ready! 🎯
                 await self.unauthorized_response(update)
                 return
             
-            # Show processing message
             processing_msg = await update.message.reply_text("🔄 Creating backup...")
             
             success, message, backup_path = self.script_manager.create_backup(is_automatic=False)
             
             if success and backup_path:
-                await processing_msg.edit_text(f"✅ Backup created successfully!\n\nSaved to: `{backup_path}`", parse_mode=ParseMode.MARKDOWN)
+                await processing_msg.edit_text("✅ Backup created! Now uploading...")
+                try:
+                    await update.message.reply_document(
+                        document=open(backup_path, 'rb'),
+                        caption=f"Here is your backup file.\n\n{message}"
+                    )
+                    await processing_msg.delete()
+                except Exception as e:
+                    await processing_msg.edit_text(f"❌ Failed to upload backup: {e}")
+                finally:
+                    # Clean up the local file after sending
+                    if os.path.exists(backup_path):
+                        os.remove(backup_path)
             else:
                 await processing_msg.edit_text(f"❌ Backup failed: {message}")
                 
         except Exception as e:
             logger.error(f"Error creating manual backup: {e}")
-            try:
-                await update.message.reply_text(f"❌ Error creating backup: {str(e)}")
-            except:
-                pass
+            await update.message.reply_text(f"❌ Error creating backup: {str(e)}")
 
 
     async def toggle_terminal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1699,67 +1708,58 @@ Your enhanced server is ready! 🎯
                 pass
 
     async def run_shell_command_safe(self, update: Update, command: str):
-        """Run a shell command safely with timeout - PREVENTS FREEZING"""
+        """Run a shell command safely with timeout and proper output escaping."""
         try:
-            # Show typing indicator
-            processing_msg = await update.message.reply_text(f"🔄 Executing: {command}")
+            processing_msg = await update.message.reply_text(f"🔄 Executing: `{command}`", parse_mode=ParseMode.MARKDOWN_V2)
+
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
             
-            # Execute command with timeout to prevent hanging
             try:
-                process = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=os.getcwd()
-                )
-                
-                # Wait for completion with timeout
-                try:
-                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    # Kill the process if it times out
-                    try:
-                        process.kill()
-                        await process.wait()
-                    except:
-                        pass
-                    
-                    await processing_msg.edit_text(
-                        f"⏰ Command timed out (30s): {command}\n\n"
-                        "💡 For interactive commands, use terminal mode with input commands."
-                    )
-                    return
-                
-                # Prepare output
-                output = ""
-                if stdout:
-                    output += stdout.decode('utf-8', errors='ignore')
-                if stderr:
-                    output += f"\n--- STDERR ---\n{stderr.decode('utf-8', errors='ignore')}"
-                
-                if not output.strip():
-                    output = "Command executed successfully (no output)"
-                
-                # Truncate if too long
-                if len(output) > 4000:
-                    output = output[:4000] + "\n\n... (output truncated)"
-                
-                response = f"💻 Command: {command}\n"
-                response += f"🔢 Exit Code: {process.returncode}\n\n"
-                response += f"```\n{output}\n```"
-                
-                await processing_msg.edit_text(response, parse_mode=ParseMode.MARKDOWN)
-                
-            except Exception as e:
-                await processing_msg.edit_text(
-                    f"❌ Error executing command: {command}\n\n```\n{str(e)}\n```", 
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                await processing_msg.edit_text(f"⏰ Command timed out: `{command}`", parse_mode=ParseMode.MARKDOWN_V2)
+                return
+
+            output = ""
+            if stdout:
+                output += stdout.decode('utf-8', errors='ignore')
+            if stderr:
+                output += f"\n--- STDERR ---\n{stderr.decode('utf-8', errors='ignore')}"
+
+            if not output.strip():
+                output = "Command executed successfully (no output)."
+
+            # Escape special characters for MarkdownV2
+            def escape_markdown(text: str) -> str:
+                escape_chars = r'_*[]()~`>#+-=|{}.!'
+                return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
+
+            response_text = f"*Command:* `{command}`\n"
+            response_text += f"*Exit Code:* `{process.returncode}`\n\n"
+
+            # Truncate output if too long
+            if len(output) > 3800:
+                output = output[:3800] + "\n\n... (output truncated)"
+
+            # Send as code block
+            response_text += f"```\n{escape_markdown(output)}\n```"
             
+            try:
+                await processing_msg.edit_text(response_text, parse_mode=ParseMode.MARKDOWN_V2)
+            except Exception as e:
+                # If markdown fails, send as plain text
+                logger.warning(f"Markdown send failed, sending as plain text. Error: {e}")
+                await processing_msg.edit_text(f"Command: {command}\nExit Code: {process.returncode}\n\n{output}")
+
         except Exception as e:
             logger.error(f"Error in run_shell_command_safe: {e}")
-            await update.message.reply_text(f"❌ Command execution failed:\n```\n{str(e)}\n```", 
-                                          parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"❌ Command execution failed: {str(e)}")
 
     async def list_processes(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """List running processes"""
@@ -2586,12 +2586,25 @@ Choose an option below:"""
             success, message, backup_path = self.script_manager.create_backup(is_automatic=False)
             
             if success and backup_path:
-                await query.edit_message_text(f"✅ Backup created successfully!\n\nSaved to: `{backup_path}`", parse_mode=ParseMode.MARKDOWN)
+                await query.edit_message_text("✅ Backup created! Now uploading...")
+                try:
+                    await query.message.reply_document(
+                        document=open(backup_path, 'rb'),
+                        caption=f"Here is your backup file.\n\n{message}"
+                    )
+                    await query.delete_message()
+                except Exception as e:
+                    await query.edit_message_text(f"❌ Failed to upload backup: {e}")
+                finally:
+                    # Clean up the local file after sending
+                    if os.path.exists(backup_path):
+                        os.remove(backup_path)
             else:
                 await query.edit_message_text(f"❌ Backup failed: {message}")
                 
         except Exception as e:
             logger.error(f"Error in export_backup_callback: {e}")
+            await query.edit_message_text(f"❌ An error occurred: {e}")
 
 
     def run(self):
