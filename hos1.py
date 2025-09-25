@@ -58,6 +58,8 @@ import zipfile
 import shutil
 import tempfile
 import httpx
+import pty
+import fcntl
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
@@ -440,14 +442,24 @@ class ScriptManager:
                 # Clear current process tracking
                 self.processes.clear()
                 self.script_stdin_pipes.clear()
+
+                # --- FIX: NORMALIZE SCRIPT PATHS AND UPDATE STATUS ---
+                scripts_dir_abs = os.path.abspath(SCRIPTS_DIR)
+                for script_id, script_info in self.scripts.items():
+                    # Update status to stopped
+                    script_info['status'] = 'stopped'
+                    script_info['last_stopped'] = datetime.now().isoformat()
+                    script_info.pop('pid', None)
+
+                    # Reconstruct the absolute file_path based on the script's file_name
+                    # This corrects paths from a different system
+                    if 'file_name' in script_info:
+                        correct_path = os.path.join(scripts_dir_abs, script_info['file_name'])
+                        if script_info.get('file_path') != correct_path:
+                            logger.info(f"Normalizing path for script {script_id}: '{script_info.get('file_path')}' -> '{correct_path}'")
+                            script_info['file_path'] = correct_path
                 
-                # Update all script statuses to stopped
-                for script_id in self.scripts:
-                    self.scripts[script_id]['status'] = 'stopped'
-                    self.scripts[script_id]['last_stopped'] = datetime.now().isoformat()
-                    # Remove PID if exists
-                    self.scripts[script_id].pop('pid', None)
-                
+                # Save the updated data with corrected paths
                 self.save_data()
                 
                 # Validate restored scripts
@@ -456,7 +468,7 @@ class ScriptManager:
                     if os.path.exists(script_info.get('file_path', '')):
                         valid_scripts += 1
                     else:
-                        logger.warning(f"Restored script file not found: {script_info.get('file_path', 'Unknown')}")
+                        logger.warning(f"Restored script file not found after normalization: {script_info.get('file_path', 'Unknown')}")
                 
                 restored_count = len(self.scripts)
                 logger.info(f"✅ Backup restoration completed successfully")
@@ -838,100 +850,134 @@ class ScriptManager:
             return f"❌ Error executing command: {str(e)}"
 
     def start_interactive_terminal(self, user_id: int) -> Tuple[bool, str]:
-        """Start interactive terminal session"""
+        """Start interactive terminal session using a PTY."""
+        if user_id in self.interactive_processes:
+            return False, "Terminal session is already active."
+
         try:
-            # Start a new bash session
+            # Create a pseudo-terminal
+            master_fd, slave_fd = pty.openpty()
+
+            # Start a new bash session in the PTY
             process = subprocess.Popen(
-                ['bash'],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                ['bash', '-i'],
+                preexec_fn=os.setsid,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
                 text=True,
-                bufsize=0
+                bufsize=1,
+                close_fds=True
             )
             
-            self.interactive_processes[user_id] = process
-            logger.info(f"Started interactive terminal for user {user_id}")
-            return True, "Interactive terminal started"
+            # Close the slave descriptor in the parent
+            os.close(slave_fd)
+
+            # Make the master descriptor non-blocking
+            fl = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+            fcntl.fcntl(master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+            self.interactive_processes[user_id] = {
+                'process': process,
+                'master_fd': master_fd
+            }
+
+            logger.info(f"Started PTY-based interactive terminal for user {user_id} with PID {process.pid}")
+            return True, "Interactive terminal started."
             
         except Exception as e:
-            logger.error(f"Error starting interactive terminal: {e}")
-            return False, f"Error starting terminal: {str(e)}"
+            logger.error(f"Error starting PTY terminal: {e}")
+            return False, f"Error starting PTY terminal: {str(e)}"
 
     def stop_interactive_terminal(self, user_id: int) -> Tuple[bool, str]:
-        """Stop interactive terminal session"""
+        """Stop interactive terminal session and clean up resources."""
+        if user_id not in self.interactive_processes:
+            return False, "No active terminal session."
+
         try:
-            if user_id in self.interactive_processes:
-                process = self.interactive_processes[user_id]
-                process.terminate()
+            session = self.interactive_processes[user_id]
+            process = session['process']
+            master_fd = session['master_fd']
+
+            # Terminate the process
+            if process.poll() is None:
                 try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                     process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-                
-                del self.interactive_processes[user_id]
-                logger.info(f"Stopped interactive terminal for user {user_id}")
-                return True, "Interactive terminal stopped"
-            else:
-                return False, "No active terminal session"
-                
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    process.wait(timeout=2)
+
+            # Close the master file descriptor
+            os.close(master_fd)
+
+            del self.interactive_processes[user_id]
+            logger.info(f"Stopped interactive terminal for user {user_id}")
+            return True, "Interactive terminal stopped."
+
         except Exception as e:
-            logger.error(f"Error stopping interactive terminal: {e}")
+            logger.error(f"Error stopping PTY terminal: {e}")
+            # Ensure cleanup
+            if user_id in self.interactive_processes:
+                del self.interactive_processes[user_id]
             return False, f"Error stopping terminal: {str(e)}"
 
     def send_input_to_terminal(self, user_id: int, input_text: str, add_newline: bool = True) -> Tuple[bool, str]:
-        """Send input to interactive terminal"""
+        """Send input to the PTY-based interactive terminal."""
+        if user_id not in self.interactive_processes:
+            return False, "No active terminal session."
+
         try:
-            if user_id not in self.interactive_processes:
-                return False, "No active terminal session"
+            session = self.interactive_processes[user_id]
+            if session['process'].poll() is not None:
+                self.stop_interactive_terminal(user_id)
+                return False, "Terminal session has ended. Please restart."
             
-            process = self.interactive_processes[user_id]
-            if process.poll() is not None:
-                return False, "Terminal session has ended"
+            master_fd = session['master_fd']
             
             if add_newline:
                 input_text += '\n'
             
-            process.stdin.write(input_text)
-            process.stdin.flush()
-            
-            return True, "Input sent to terminal"
+            os.write(master_fd, input_text.encode())
+            return True, "Input sent."
             
         except Exception as e:
-            logger.error(f"Error sending input to terminal: {e}")
+            logger.error(f"Error sending input to PTY: {e}")
             return False, f"Error sending input: {str(e)}"
 
-    def read_terminal_output(self, user_id: int, timeout: float = 1.0) -> str:
-        """Read output from interactive terminal"""
+    def read_terminal_output(self, user_id: int, timeout: float = 0.5) -> str:
+        """Read output from the PTY-based interactive terminal."""
+        if user_id not in self.interactive_processes:
+            return "No active terminal session."
+
         try:
-            if user_id not in self.interactive_processes:
-                return "No active terminal session"
+            session = self.interactive_processes[user_id]
+            if session['process'].poll() is not None:
+                self.stop_interactive_terminal(user_id)
+                return "Terminal session has ended. Please restart."
+
+            master_fd = session['master_fd']
             
-            process = self.interactive_processes[user_id]
-            if process.poll() is not None:
-                return "Terminal session has ended"
+            # Use select to wait for data to be available for reading
+            ready_to_read, _, _ = select.select([master_fd], [], [], timeout)
             
-            # Non-blocking read with timeout
-            import select
-            ready, _, _ = select.select([process.stdout], [], [], timeout)
-            
-            if ready:
+            if ready_to_read:
                 output = ""
                 while True:
-                    ready, _, _ = select.select([process.stdout], [], [], 0.1)
-                    if not ready:
+                    try:
+                        chunk = os.read(master_fd, 1024)
+                        if not chunk:
+                            break
+                        output += chunk.decode(errors='ignore')
+                    except BlockingIOError:
+                        # No more data to read at the moment
                         break
-                    chunk = process.stdout.read(1024)
-                    if not chunk:
-                        break
-                    output += chunk
-                return output if output else "No output received"
+                return output if output else "No output received."
             else:
-                return "No output received"
+                return "No output received."
                 
         except Exception as e:
-            logger.error(f"Error reading terminal output: {e}")
+            logger.error(f"Error reading PTY output: {e}")
             return f"Error reading output: {str(e)}"
 
 
